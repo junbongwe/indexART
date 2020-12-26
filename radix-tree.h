@@ -34,7 +34,6 @@ struct radix_tree_node {
 	unsigned char type;
 	unsigned char level;
 	unsigned char count;
-	unsigned char compact_count;
 	unsigned long long offset;
 	unsigned long long lock_n_obsolete;
 };
@@ -88,7 +87,7 @@ void radix_tree_destroy(radix_tree_root root);
 struct radix_tree_node *radix_tree_create(void);
 enum lookup_results radix_tree_lookup(radix_tree_root root, unsigned long long index, struct radix_tree_leaf **leaf);
 void radix_tree_insert(radix_tree_root root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id);
-void radix_tree_delete(struct radix_tree_leaf *leaf);
+void radix_tree_remove(radix_tree_root root, struct radix_tree_leaf *leaf);
 
 #ifdef __cplusplus
 }
