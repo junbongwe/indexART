@@ -15,7 +15,7 @@
 #else
 #define radix_assert(EXP) {}
 #endif
-
+#define radix_unreachable() {assert(false); __builtin_unreachable();}
 #define barrier() asm volatile("": : :"memory")
 
 // TID Allocator
@@ -185,8 +185,7 @@ static inline void *return_node_to_pool (void *node, unsigned long long length, 
 			return ret_head;
 		}
 	}
-	radix_assert(false);
-	__builtin_unreachable();
+	radix_unreachable();
 }
 
 void return_node(struct radix_tree_node *new_node){
@@ -479,8 +478,7 @@ static inline void *get_node_from_pool (unsigned long long length, enum node_typ
 			}
 		}
 	}
-	radix_assert(false);
-	__builtin_unreachable();
+	radix_unreachable();
 }
 
 /* Allocate node of type TYPE. Caller should fill zero if necessary. */
@@ -625,8 +623,7 @@ static inline struct radix_tree_node *get_node(enum node_types type){
 			return (struct radix_tree_node*)n256;
 		}
 	}
-	radix_assert(false);
-	__builtin_unreachable();
+	radix_unreachable();
 }
 
 // Mutex implememtation for Radix tree nodes
@@ -689,6 +686,9 @@ void radix_tree_destroy(radix_tree_root root) {
 	return;
 }
 
+/* Get child with KEY from PARENT_ node and store child node to NODEP. Parent LEVEL should be given to check child key again.
+   If there is child with KEY, return that child. If there is no child with KEY, look for closest previous node and return if
+   exist. If there is no previous node, look for closest next node and return. */
 static inline enum lookup_results get_child_range(struct radix_tree_node *parent_, struct radix_tree_node **nodep, unsigned char key, unsigned char level) {
 	struct radix_tree_node *i_node, *ret_node;
 	unsigned char index_idx, index_pos, bit_idx;
@@ -705,11 +705,11 @@ n4_begin:
 			count = parent->node.count;
 			ret_diff = INT_MAX;
 			ret_node = NULL;
-			barrier();
+			ret_key = 0;
 			for (i = count - 1; i >= 0; i--) {
 				i_key = parent->key[i];
-				i_diff = (int)i_key - (int)key;
 				barrier();
+				i_diff = (int)i_key - (int)key;
 				if (i_diff == 0) {
 					if ((ret_node = parent->slots[i]) != NULL) {
 						if (is_fault_node(ret_node, key, level))
@@ -719,7 +719,7 @@ n4_begin:
 					}
 				}
 				else if (i_diff < 0) {
-					if (ret_diff > 0 || ret_diff < i_diff) {
+					if ((ret_diff > 0) || (ret_diff < i_diff)) {
 						if ((i_node = parent->slots[i]) != NULL) {
 							ret_diff = i_diff;
 							ret_node = i_node;
@@ -728,7 +728,7 @@ n4_begin:
 					}
 				}
 				else {
-					if (ret_diff > 0 && ret_diff > i_diff) {
+					if ((ret_diff > 0) && (ret_diff > i_diff)) {
 						if ((i_node = parent->slots[i]) != NULL) {
 							ret_diff = i_diff;
 							ret_node = i_node;
@@ -749,13 +749,14 @@ n4_begin:
 			parent = (struct N16 *)parent_;
 n16_begin:
 			count = parent->node.count;
+			barrier();
 			ret_diff = INT_MAX;
 			ret_node = NULL;
-			barrier();
+			ret_key = 0;
 			for (i = count - 1; i >= 0; i--) {
 				i_key = parent->key[i];
-				i_diff = (int)i_key - (int)key;
 				barrier();
+				i_diff = (int)i_key - (int)key;
 				if (i_diff == 0) {
 					if ((ret_node = parent->slots[i]) != NULL) {
 						if (is_fault_node(ret_node, key, level))
@@ -765,7 +766,7 @@ n16_begin:
 					}
 				}
 				else if (i_diff < 0) {
-					if (ret_diff > 0 || ret_diff < i_diff) {
+					if ((ret_diff > 0) || (ret_diff < i_diff)) {
 						if ((i_node = parent->slots[i]) != NULL) {
 							ret_diff = i_diff;
 							ret_node = i_node;
@@ -774,7 +775,7 @@ n16_begin:
 					}
 				}
 				else {
-					if (ret_diff > 0 && ret_diff > i_diff) {
+					if ((ret_diff > 0) && (ret_diff > i_diff)) {
 						if ((i_node = parent->slots[i]) != NULL) {
 							ret_diff = i_diff;
 							ret_node = i_node;
@@ -785,7 +786,7 @@ n16_begin:
 			}
 			radix_assert(ret_node != NULL);
 			*nodep = ret_node;
-			if (ret_key != ((ret_node->offset >> (((ret_node->level - level - 1) * RADIX_TREE_ENTRY_BIT_SIZE))) & RADIX_TREE_MAP_MASK))
+			if (is_fault_node(ret_node, ret_key, level))
 				goto n16_begin;
 			return (ret_key < key) ? RET_PREV_NODE : RET_NEXT_NODE;
 		}
@@ -794,7 +795,6 @@ n16_begin:
 		case N48:
 			parent = (struct N48 *)parent_;
 n48_begin:
-
 			if ((idx = parent->key[key]) != N48_NO_ENT) {
 				if ((ret_node = parent->slots[idx]) != NULL) {
 					if (is_fault_node(ret_node, key, level))
@@ -888,7 +888,7 @@ n48_begin:
 					bitfield ^= (1ULL << ((BITS_PER_INDEX - 1) - bit_idx));
 				}
 			}
-			radix_assert(false);
+			radix_unreachable();
 		}
 		{
 		struct N256 *parent;
@@ -964,10 +964,11 @@ n48_begin:
 			}
 		}
 	}
-	radix_assert(false);
-	__builtin_unreachable();
+	radix_unreachable();
 }
 
+/* Get ramaining child in PARENT_ node whose key is not equal to KEY.
+   This function should be called after acquiring PARENT_ lock. */
 static inline struct radix_tree_node *get_child_remain(struct radix_tree_node *parent_, unsigned char key) {
 	int idx, index_idx, index_pos;
 	switch (parent_->type) {
@@ -987,7 +988,7 @@ static inline struct radix_tree_node *get_child_remain(struct radix_tree_node *p
 		struct N48 *parent;
 		case N48:
 			parent = (struct N48 *)parent_;
-			for (index_idx = 0; index_idx < 4; index_idx++) {
+			for (index_idx = 0; index_idx < RADIX_TREE_INDEX_SIZE; index_idx++) {
 				unsigned long long bitfield = parent->index[index_idx];
 				while (bitfield) {
 					index_pos = __builtin_ctzll(bitfield);
@@ -1000,14 +1001,13 @@ static inline struct radix_tree_node *get_child_remain(struct radix_tree_node *p
 					bitfield ^= (1ULL << index_pos);
 				}
 			}
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 		}
 		{
 		struct N256 *parent;
 		case N256:
 			parent = (struct N256 *)parent_;
-			for (index_idx = 0; index_idx < 4; index_idx++) {
+			for (index_idx = 0; index_idx < RADIX_TREE_INDEX_SIZE; index_idx++) {
 				unsigned long long bitfield = parent->index[index_idx];
 				while (bitfield) {
 					index_pos = __builtin_ctzll(bitfield);
@@ -1019,15 +1019,14 @@ static inline struct radix_tree_node *get_child_remain(struct radix_tree_node *p
 					bitfield ^= (1ULL << index_pos);
 				}
 			}
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
+/* Get child with exact KEY from PARENT_ node. Parent LEVEL should be given to check child key again. */
 static struct radix_tree_node *get_child(struct radix_tree_node *parent_, unsigned char key, unsigned char level) {
 	struct radix_tree_node *child;
 	int idx, count;
@@ -1057,7 +1056,7 @@ n4_begin:
 n16_begin:
 			count = parent->node.count;
 			barrier();
-			unsigned short bitfield = (_mm_cmpeq_epi8_mask(_mm_set1_epi8(key), _mm_loadu_si128((__m128i *)parent->key))) & ((1 << count) - 1);
+			unsigned short bitfield = _mm_cmpeq_epi8_mask(_mm_set1_epi8(key), _mm_loadu_si128((__m128i *)parent->key)) & ((1 << count) - 1);
 			while (bitfield) {
 				unsigned char pos = 31 - __builtin_clz(bitfield);
 				if ((child = parent->slots[pos]) != NULL) {
@@ -1090,13 +1089,16 @@ n48_begin:
 			return parent->slots[key];
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
+/* Insert CHILD node to PARENT_ node with KEY. Return true for success, false for failure(need to expand node).
+   WRITE OPERATION, PARENT_ lock should be acquired by caller. */
 static inline bool insert_child(struct radix_tree_node *parent_, unsigned char key, struct radix_tree_node *child) {
 	int idx;
+	unsigned char index_idx;
+	unsigned long long bitfield, bitmask;
 	switch (parent_->type) {
 		{
 		struct N4 *parent;
@@ -1108,7 +1110,7 @@ static inline bool insert_child(struct radix_tree_node *parent_, unsigned char k
 			barrier();
 			parent->slots[idx] = child;
 			barrier();
-			parent->node.count = idx + 1;
+			parent_->count = idx + 1;
 			return true;
 		}
 		{
@@ -1121,16 +1123,13 @@ static inline bool insert_child(struct radix_tree_node *parent_, unsigned char k
 			barrier();
 			parent->slots[idx] = child;
 			barrier();
-			parent->node.count = idx + 1;
+			parent_->count = idx + 1;
 			return true;
 		}
 		{
 		struct N48 *parent;
 		case N48:
 			parent = (struct N48 *)parent_;
-			unsigned char index_idx;
-			unsigned long long bitfield, bitmask;
-			int idx;
 			if (parent->key[key] != N48_NO_ENT) {
 				radix_assert(parent->slots[parent->key[key]] == NULL);
 				parent->slots[parent->key[key]] = child;
@@ -1147,16 +1146,16 @@ static inline bool insert_child(struct radix_tree_node *parent_, unsigned char k
 			parent->key[key] = idx;
 			barrier();
 			parent->index[index_idx] = (bitfield | bitmask);
-			parent->node.count = idx + 1;
+			parent_->count = idx + 1;
 			return true;
 		}
 		{
 		struct N256 *parent;
 		case N256:
 			parent = (struct N256 *)parent_;
-			unsigned char index_idx = key / BITS_PER_INDEX;
-			unsigned long long bitfield = parent->index[index_idx];
-			unsigned long long bitmask = (1ULL << (BITS_PER_INDEX - 1 - (key % BITS_PER_INDEX)));
+			index_idx = key / BITS_PER_INDEX;
+			bitfield = parent->index[index_idx];
+			bitmask = (1ULL << (BITS_PER_INDEX - 1 - (key % BITS_PER_INDEX)));
 			radix_assert(parent->slots[key] == NULL);
 			radix_assert((bitfield & bitmask) == 0);
 			parent->slots[key] = child;
@@ -1166,11 +1165,12 @@ static inline bool insert_child(struct radix_tree_node *parent_, unsigned char k
 			return true;
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
+/* Insert CHILD node to PARENT_ node with KEY. This function must succeed. 
+   No internal synchronization, PARENT_ should not be inserted to tree yet. */
 static inline void insert_child_force(struct radix_tree_node *parent_, unsigned char key, struct radix_tree_node *child) {
 	switch (parent_->type) {
 		{
@@ -1214,13 +1214,13 @@ static inline void insert_child_force(struct radix_tree_node *parent_, unsigned 
 			break;
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
+/* Delete child with KEY from PARENT_ node. This function must succeed. */
 static inline void delete_child(struct radix_tree_node *parent_, unsigned char key) {
-	unsigned char last_idx, idx;
+	unsigned char idx, last_idx, index_idx, index_pos;
 	switch (parent_->type) {
 		{
 		struct N4 *parent;
@@ -1278,12 +1278,13 @@ static inline void delete_child(struct radix_tree_node *parent_, unsigned char k
 		struct N48 *parent;
 		case N48:
 			parent = (struct N48 *)parent_;
-			unsigned char index_idx = key / BITS_PER_INDEX;
-			unsigned char index_pos = key % BITS_PER_INDEX;
 			idx = parent->key[key];
 			last_idx = parent_->count - 1;
+			index_idx = key / BITS_PER_INDEX;
+			index_pos = key % BITS_PER_INDEX;
 			radix_assert(idx != N48_NO_ENT);
 			parent->index[index_idx] &= (~(1ULL << (BITS_PER_INDEX - 1 - index_pos)));
+			barrier();
 			if (idx == last_idx) {
 				parent->slots[idx] = NULL;
 				parent->key[key] = N48_NO_ENT;
@@ -1291,15 +1292,16 @@ static inline void delete_child(struct radix_tree_node *parent_, unsigned char k
 				return;
 			}
 			
-			unsigned char i, last_key = 0;
+			unsigned char i, last_key = N48_NO_ENT;
 			unsigned long long bitfield;
-			for (i = 0; i < 4; i++) {
+			for (i = 0; i < RADIX_TREE_INDEX_SIZE; i++) {
 				bitfield = _mm512_cmpeq_epi8_mask(_mm512_set1_epi8(last_idx), _mm512_loadu_si512((__m512i *)&parent->key[64 * i]));
 				if (bitfield) {
 					last_key = (64 * i) + __builtin_ctzll(bitfield);
 					break;
 				}
 			}
+			radix_assert(last_idx != N48_NO_ENT);
 			radix_assert(parent->key[last_key] == last_idx);
 
 			parent->slots[idx] = NULL;
@@ -1314,17 +1316,17 @@ static inline void delete_child(struct radix_tree_node *parent_, unsigned char k
 		struct N256 *parent;
 		case N256:
 			parent = (struct N256 *)parent_;
-			unsigned char index_idx = key / BITS_PER_INDEX;
-			unsigned char index_pos = key % BITS_PER_INDEX;
+			index_idx = key / BITS_PER_INDEX;
+			index_pos = key % BITS_PER_INDEX;
 			radix_assert(parent->slots[key] != NULL);
 			parent->index[index_idx] &= (~(1ULL << (BITS_PER_INDEX - 1 - index_pos)));
+			barrier();
 			parent->slots[key] = NULL;
 			parent_->count--;
 			return;
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
@@ -1342,8 +1344,7 @@ static inline void update_child(struct radix_tree_node *parent_, unsigned char k
 					return;
 				}
 			}
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 		}
 		{
 		struct N16 *parent;
@@ -1376,11 +1377,11 @@ static inline void update_child(struct radix_tree_node *parent_, unsigned char k
 			return;
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
+/* Init NODE with given LEVEL, COUNT, OFFSET. */
 static inline void init_node(struct radix_tree_node *node, unsigned char level, unsigned char count, unsigned long long offset) {
 	node->level = level;
 	node->count = count;
@@ -1388,19 +1389,19 @@ static inline void init_node(struct radix_tree_node *node, unsigned char level, 
 	node->lock_n_obsolete = 0;
 }
 
-/* Trim deleted node to make free slots. If there is no free slots, expand node
-   and copy all the child. Allways return new node to provide read consistency.
-   *** Write Operation, WRITE LOCK SHOULD BE ACQUIRED BY CALLER. */
+/* Expand NODE_ to larger node type. Allocate new node, copy all the child and return the new node.
+   WRITE OPERATION, NODE_ lock should be acquired by caller. */
 static inline struct radix_tree_node *radix_node_expand(struct radix_tree_node *node_) {
+	int i;
+	unsigned char key;
 	switch (node_->type) {
 		{
 		struct N4 *node;
 		struct N16 *new_node;
 		case N4:
 			node = (struct N4 *)node_;
-			int i;
-			radix_assert(node->node.count == 4);
 			new_node = (struct N16 *)get_node(N16);
+			radix_assert(node->node.count == 4);
 			init_node(&new_node->node, node_->level, 4, node_->offset);
 			for (i = 0; i < 4; i++) {
 				radix_assert(node->slots[i] != NULL);
@@ -1414,13 +1415,12 @@ static inline struct radix_tree_node *radix_node_expand(struct radix_tree_node *
 		struct N48 *new_node;
 		case N16:
 			node = (struct N16 *)node_;
-			int i;
-			radix_assert(node->node.count == 16);
 			new_node = (struct N48 *)get_node(N48);
-			unsigned char key;
+			radix_assert(node->node.count == 16);
 			init_node(&new_node->node, node_->level, 16, node_->offset);
 			memset(new_node->key, N48_NO_ENT, sizeof(new_node->key));
 			memset(new_node->index, 0, sizeof(new_node->index));
+			memset(new_node->slots, 0, sizeof(new_node->slots));
 			for (i = 0; i < 16; i++) {
 				radix_assert(node->slots[i] != NULL);
 				key = node->key[i];
@@ -1435,16 +1435,14 @@ static inline struct radix_tree_node *radix_node_expand(struct radix_tree_node *
 		struct N256 *new_node;
 		case N48:
 			node = (struct N48 *)node_;
-			unsigned long long bitfield;
-			unsigned char key;
-			int i, bit_idx, entry_idx;
-			radix_assert(node->node.count == 48);
 			new_node = (struct N256 *)get_node(N256);
+			radix_assert(node->node.count == 48);
 			init_node(&new_node->node, node_->level, 48, node_->offset);
 			memset(new_node->slots, 0, sizeof(new_node->slots));
 			memset(new_node->index, 0, sizeof(new_node->index));
 			for (i = 0; i < 4; i++) {
-				bitfield = node->index[i];
+				unsigned long long bitfield = node->index[i];
+				int bit_idx, entry_idx;
 				while (bitfield) {
 					bit_idx = __builtin_ctzll(bitfield);
 					key = (BITS_PER_INDEX * i) + (BITS_PER_INDEX - 1) - bit_idx;
@@ -1460,13 +1458,13 @@ static inline struct radix_tree_node *radix_node_expand(struct radix_tree_node *
 			return (struct radix_tree_node *)new_node;
 		}
 		default:
-			radix_assert(false);
-			__builtin_unreachable();
+			radix_unreachable();
 	}
 }
 
+/* Check prefix between CUR_INDEX and TARGET_PREFIX_ with CUR_LEVEL and TARGET_LEVEL.
+   If prefix match, return PREFIX_MATCH. Otherwise, return PREFIX_PREV or PREFIX_NEXT accordingly. */
 enum check_prefix_result {PREFIX_PREV, PREFIX_MATCH, PREFIX_NEXT};
-
 static inline enum check_prefix_result check_prefix(unsigned long long cur_index, unsigned long long target_prefix_,
 		unsigned char cur_level, unsigned char target_level) {
 	unsigned long long cur_prefix = cur_index >> ((RADIX_TREE_HEIGHT + 1 - target_level) * RADIX_TREE_ENTRY_BIT_SIZE);
@@ -1480,6 +1478,7 @@ static inline enum check_prefix_result check_prefix(unsigned long long cur_index
 		return PREFIX_NEXT;
 }
 
+/* Do lookup with given ROOT and INDEX. */
 static inline struct radix_tree_node *radix_tree_do_lookup(struct radix_tree_node *root, unsigned long long index) {
 	struct radix_tree_node *node = root;
 	unsigned long long cur_index = index;
@@ -1525,6 +1524,7 @@ static inline struct radix_tree_node *radix_tree_do_lookup(struct radix_tree_nod
 	return NULL;
 }
 
+/* Lookup operation entry point. Find leaf with INDEX from ROOT and store the leaf to LEAF. */
 enum lookup_results radix_tree_lookup(radix_tree_root root, unsigned long long index, struct radix_tree_leaf **leaf) {
 	unsigned long long ret_index;
 	struct radix_tree_leaf *ret_leaf;
@@ -1565,6 +1565,7 @@ enum lookup_results radix_tree_lookup(radix_tree_root root, unsigned long long i
 	}
 }
 
+/* Allocate new leaf and initialize with given INDEX, LENGTH, LOG_ADDR, TX_ID, and return the new leaf. */
 static inline struct radix_tree_node *alloc_init_leaf(unsigned long long index, unsigned long long length, void *log_addr, int tx_id) {
 	struct radix_tree_node *node = get_node(LEAF_NODE);
 	struct radix_tree_leaf *leaf = (struct radix_tree_leaf *)node;
@@ -1581,6 +1582,7 @@ static inline struct radix_tree_node *alloc_init_leaf(unsigned long long index, 
 	return node;
 }
 
+/* Insert operation entry point. Insert leaf with INDEX to ROOT. Initialize leaf with given INDEX, LENGTH, LOG_ADDR, TX_ID. */
 void radix_tree_insert(radix_tree_root root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id) {
 	radix_assert((index >> 40) == 0);
 	struct radix_tree_node *node, *child_node, *parent_node;
@@ -1725,6 +1727,7 @@ restart:
 	}
 }
 
+/* Remove operation entry point. Remove LEAF from ROOT. */
 void radix_tree_remove(radix_tree_root root, struct radix_tree_leaf *leaf) {
 	struct radix_tree_node *node, *child_node, *parent_node, *leaf_node = (struct radix_tree_node *)leaf;
 	unsigned long long parent_version, node_version = 0;
