@@ -13,8 +13,16 @@ extern "C"
 #define RADIX_TREE_MAP_MASK (RADIX_TREE_MAP_SIZE - 1)
 #define OFFSET_SIZE (RADIX_TREE_HEIGHT + 1)
 
+#ifdef RADIX_DEBUG
+#define radix_assert(EXP) assert(EXP)
+#else
+#define radix_assert(EXP) {}
+#endif
+#define radix_unreachable() {assert(false); __builtin_unreachable();}
+#define barrier() asm volatile("": : :"memory")
 
 #define MOVE_BLOCK_SIZE (1UL<<12)
+#define MAX_TRANSACTION 32
 
 enum lookup_results {
 	RET_MATCH_NODE, /* Node with requested offset found. */
@@ -81,6 +89,11 @@ struct radix_tree_node_list {
 struct radix_tree_leaf_list {
 	struct radix_tree_leaf *leaf;
 };
+
+int get_tid(void);
+int build_node(unsigned long long n, enum node_types type);
+struct radix_tree_node *get_node(enum node_types type);
+void return_node(struct radix_tree_node *new_node);
 
 int radix_tree_init();
 void radix_tree_destroy(radix_tree_root root);

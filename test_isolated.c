@@ -1,8 +1,9 @@
-#include "radix-tree.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <pthread.h>
+
+#include "radix_tree.h"
 
 struct radix_tree_node *root = NULL;
 

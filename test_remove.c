@@ -3,7 +3,7 @@
 #include <time.h>
 #include <pthread.h>
 
-#include "radix-tree.h"
+#include "radix_tree.h"
 
 #define THREADS_CNT 16
 

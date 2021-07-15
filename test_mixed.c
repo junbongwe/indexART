@@ -4,7 +4,7 @@
 #include <pthread.h>
 #include <limits.h>
 
-#include "radix-tree.h"
+#include "radix_tree.h"
 
 #define WRITE_THREAD_CNT 16
 #define READ_THREAD_CNT 16
