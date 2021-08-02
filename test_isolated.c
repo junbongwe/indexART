@@ -5,7 +5,7 @@
 
 #include "radix_tree.h"
 
-struct radix_tree_node *root = NULL;
+struct radix_tree_root root;
 
 int quiet = 1;
 unsigned int seed;
@@ -67,6 +67,22 @@ void *thread_main(void *aux) {
     return NULL;
 }
 
+unsigned long long check_inserted_leaf() {
+    struct radix_tree_leaf *leaf, *next_leaf;
+    unsigned long long cnt = 0;
+
+    radix_tree_lookup(&root, 0, &leaf);
+
+    while (leaf) {
+	    cnt++;
+	    next_leaf = leaf->next;
+	    if (next_leaf && (leaf->node.offset >= next_leaf->node.offset))
+		    return -1;
+	    leaf = next_leaf;
+    }
+    return cnt;
+}
+
 int main(int argc, char *argv[]) {
     pthread_t threads[THREAD_CNT];
     int thread_cnt = 0;
@@ -89,6 +105,7 @@ int main(int argc, char *argv[]) {
     srand(seed);
 
     radix_tree_init();
+    radix_tree_create(&root);
     while (thread_cnt < THREAD_CNT)
         pthread_create(&threads[thread_cnt++], NULL, &thread_main, (void *)ops_per_thread);
     for (thread_cnt = 0; thread_cnt < THREAD_CNT; thread_cnt++) {
@@ -96,5 +113,7 @@ int main(int argc, char *argv[]) {
     }
 
     thread_main((void *)total_ops);
+    printf("%llu\n", check_inserted_leaf());
+
     return 0;
 }

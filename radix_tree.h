@@ -5,6 +5,7 @@ extern "C"
 
 #include <stdbool.h>
 #include <limits.h>
+#include <pthread.h>
 
 #define RADIX_TREE_ENTRY_BIT_SIZE 8
 #define RADIX_TREE_HEIGHT 4 /* Starts from 0 */
@@ -53,6 +54,7 @@ struct radix_tree_leaf {
 	void *log_addr;
 	struct radix_tree_leaf *prev;
 	struct radix_tree_leaf *next;
+	pthread_mutex_t lock;
 };
 
 struct N4 {
@@ -80,7 +82,11 @@ struct N256 {
 	unsigned long long index[RADIX_TREE_INDEX_SIZE];
 };
 
-typedef struct radix_tree_node **radix_tree_root;
+struct radix_tree_root {
+	struct radix_tree_node *root_node;
+	struct radix_tree_leaf head;
+	struct radix_tree_leaf tail;
+};
 
 struct radix_tree_node_list {
 	struct radix_tree_node *node;
@@ -96,11 +102,11 @@ struct radix_tree_node *get_node(enum node_types type);
 void return_node(struct radix_tree_node *new_node);
 
 int radix_tree_init();
-void radix_tree_destroy(radix_tree_root root);
-struct radix_tree_node *radix_tree_create(void);
-enum lookup_results radix_tree_lookup(radix_tree_root root, unsigned long long index, struct radix_tree_leaf **leaf);
-void radix_tree_insert(radix_tree_root root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id);
-void radix_tree_remove(radix_tree_root root, struct radix_tree_leaf *leaf);
+void radix_tree_destroy(struct radix_tree_root *root);
+void radix_tree_create(struct radix_tree_root *root);
+enum lookup_results radix_tree_lookup(struct radix_tree_root *root, unsigned long long index, struct radix_tree_leaf **leaf);
+void radix_tree_insert(struct radix_tree_root *root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id);
+void radix_tree_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf);
 
 #ifdef __cplusplus
 }

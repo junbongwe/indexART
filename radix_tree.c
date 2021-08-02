@@ -8,6 +8,16 @@
 
 #include "radix_tree.h"
 
+// Mutex implementation for Radix tree root
+#define ROOT_LOCK_BIT (1ULL << 63)
+#define get_root_node(ROOT) \
+	((typeof((ROOT)->root_node))(((unsigned long long)atomic_load(&(ROOT)->root_node)) & (ROOT_LOCK_BIT - 1)))
+#define root_write_unlock(ROOT, NEW_ROOT_NODE) (atomic_store(&(ROOT)->root_node, (NEW_ROOT_NODE)))
+#define root_write_lock_or_restart(ROOT, ROOT_NODE) \
+	(__sync_val_compare_and_swap(&(ROOT)->root_node, (ROOT_NODE), \
+				     (typeof((ROOT)->root_node))(((unsigned long long)(ROOT_NODE)) | ROOT_LOCK_BIT)) != (ROOT_NODE))
+#define ROOT_END_OFS (1ULL << 40)
+
 // Mutex implememtation for Radix tree nodes
 #define get_version(NODE) (atomic_load(&(NODE)->lock_n_obsolete))
 #define is_locked(VERSION) (((VERSION) & 0b10) == 0b10)
@@ -54,6 +64,8 @@ static void return_node_to_gc(struct radix_tree_node *node) {
 #define is_leaf(NODE) ((NODE)->type == LEAF_NODE)
 #define is_fault_node(NODE, KEY, PARENT_LEVEL) \
 		((KEY) != (((NODE)->offset >> ((((NODE)->level - (PARENT_LEVEL) - 1) * RADIX_TREE_ENTRY_BIT_SIZE))) & RADIX_TREE_MAP_MASK))
+#define test_leaf_range_or_restart(PREV, NEXT, IDX) \
+	((((PREV)->node.offset != ROOT_END_OFS) && ((PREV)->node.offset >= (IDX))) || ((NEXT)->node.offset <= (IDX)))
 
 int radix_tree_init() {
 	build_node(10000, LEAF_NODE);
@@ -64,9 +76,22 @@ int radix_tree_init() {
 	return 0;
 }
 
-void radix_tree_destroy(radix_tree_root root) {
+void radix_tree_destroy(struct radix_tree_root *root) {
 	return;
 }
+
+void radix_tree_create(struct radix_tree_root *root) {
+	memset(root, 0x0, sizeof(*root));
+	root->head.node.offset = ROOT_END_OFS;
+	root->tail.node.offset = ROOT_END_OFS;
+	root->head.next = &root->tail;
+	root->tail.prev = &root->head;
+	pthread_mutex_init(&root->head.lock, NULL);
+	pthread_mutex_init(&root->tail.lock, NULL);
+}
+
+static inline void radix_tree_do_insert(struct radix_tree_root *root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id, bool lock_leaf_);
+static inline void radix_tree_do_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf, bool lock_leaf);
 
 /* Get child with KEY from PARENT_ node and store child node to NODEP. Parent LEVEL should be given to check child key again.
    If there is child with KEY, return that child. If there is no child with KEY, look for closest previous node and return if
@@ -771,6 +796,19 @@ static inline void init_node(struct radix_tree_node *node, unsigned char level, 
 	node->lock_n_obsolete = 0;
 }
 
+static inline bool radix_node_need_expand(struct radix_tree_node *node) {
+	switch (node->type) {
+		case N4:
+			return (node->count == 4);
+		case N16:
+			return (node->count == 16);
+		case N48:
+			return (node->count == 48);
+		default:
+			return false;
+	}
+}
+
 /* Expand NODE_ to larger node type. Allocate new node, copy all the child and return the new node.
    WRITE OPERATION, NODE_ lock should be acquired by caller. */
 static inline struct radix_tree_node *radix_node_expand(struct radix_tree_node *node_) {
@@ -907,7 +945,7 @@ static inline struct radix_tree_node *radix_tree_do_lookup(struct radix_tree_nod
 }
 
 /* Lookup operation entry point. Find leaf with INDEX from ROOT and store the leaf to LEAF. */
-enum lookup_results radix_tree_lookup(radix_tree_root root, unsigned long long index, struct radix_tree_leaf **leaf) {
+enum lookup_results radix_tree_lookup(struct radix_tree_root *root, unsigned long long index, struct radix_tree_leaf **leaf) {
 	unsigned long long ret_index;
 	struct radix_tree_leaf *ret_leaf;
 
@@ -916,7 +954,7 @@ enum lookup_results radix_tree_lookup(radix_tree_root root, unsigned long long i
 		return EFAULT_RADIX;
 	}
 	
-	ret_leaf = (struct radix_tree_leaf *)radix_tree_do_lookup(*root, index);
+	ret_leaf = (struct radix_tree_leaf *)radix_tree_do_lookup(get_root_node(root), index);
 	if (ret_leaf == NULL) {
 		*leaf = NULL;
 		return ENOEXIST_RADIX;
@@ -960,34 +998,157 @@ static inline struct radix_tree_node *alloc_init_leaf(unsigned long long index, 
 	leaf->log_addr = log_addr;
 	leaf->prev = NULL;
 	leaf->next = NULL;
+	pthread_mutex_init(&leaf->lock, NULL);
+	pthread_mutex_lock(&leaf->lock);
 
 	return node;
 }
 
+static inline struct radix_tree_leaf *get_left_most_leaf(struct radix_tree_node *start) {
+	struct radix_tree_node *node = start;
+	while (!is_leaf(node)) {
+		get_child_range(node, &node, 0, node->level);
+	}
+	return (struct radix_tree_leaf *)node;
+}
+
+static inline struct radix_tree_leaf *get_right_most_leaf(struct radix_tree_node *start) {
+	struct radix_tree_node *node = start;
+	while (!is_leaf(node)) {
+		get_child_range(node, &node, 0xFF, node->level);
+	}
+	return (struct radix_tree_leaf *)node;
+}
+
+static inline void link_and_remove_leaf(struct radix_tree_root *root, unsigned long long index, unsigned long long length, struct radix_tree_leaf *new_leaf, struct radix_tree_leaf *prev_leaf, struct radix_tree_leaf *next_leaf) {
+	struct radix_tree_leaf *leaf = new_leaf->next, *next = NULL;
+	unsigned long long end = index + length;
+
+	radix_assert(prev_leaf && next_leaf);
+
+	if (prev_leaf->node.offset != ROOT_END_OFS) {
+		unsigned long long prev_end = prev_leaf->node.offset + prev_leaf->length;
+		if (prev_end > end) {
+			next_leaf->prev = new_leaf;
+			prev_leaf->length = index - prev_leaf->node.offset;
+			radix_tree_do_insert(root, end, prev_end - end, prev_leaf->log_addr + (end - prev_leaf->node.offset), prev_leaf->tx_id, false);
+			return;
+		}
+		if ((prev_leaf->node.offset + prev_leaf->length) > index)
+			prev_leaf->length = index - prev_leaf->node.offset;
+	}
+
+	while (true) {
+		if (leaf == NULL)
+			return;
+		if (leaf->node.offset + leaf->length <= end) {
+			next = leaf->next;
+			radix_tree_do_remove(root, leaf, false);
+			pthread_mutex_unlock(&leaf->lock);
+			leaf = next;
+		}
+		else if (leaf->node.offset < end) {
+			radix_tree_do_insert(root, end, leaf->length + leaf->node.offset - end, leaf->log_addr + end - leaf->node.offset, leaf->tx_id, false);
+			radix_tree_do_remove(root, leaf, false);
+			pthread_mutex_unlock(&leaf->lock);
+			return;
+		}
+		else
+			return;
+	}
+}
+
+
+/* Unlock leaf sequentially. */
+static inline void unlock_leaf_seq(struct radix_tree_leaf *begin, unsigned long long end) {
+	struct radix_tree_leaf *cur = begin, *next;
+
+	radix_assert(cur != NULL);
+	do {
+		next = cur->next;
+		barrier();
+		pthread_mutex_unlock(&cur->lock);
+		cur = next;
+	} while ((cur->node.offset + cur->length) != end);
+	pthread_mutex_unlock(&cur->lock);
+}
+
+/* Lock leaf sequentially. Either PREV_LEAF or NEXT_LEAF should be non-NULL.
+ * We can check transaction conflict at this point. */
+static inline unsigned long long lock_leaf_seq_or_restart(struct radix_tree_leaf *prev_leaf, struct radix_tree_leaf *next_leaf, unsigned long long index, unsigned long long length) {
+	struct radix_tree_leaf *cur = next_leaf;
+	unsigned long long end = index + length;
+
+	radix_assert(prev_leaf && next_leaf);
+
+	pthread_mutex_lock(&prev_leaf->lock);
+	if ((prev_leaf->next != next_leaf) || (next_leaf->prev != prev_leaf)) {
+		radix_assert((prev_leaf->node.offset == ROOT_END_OFS) || (prev_leaf->node.offset < index));
+		pthread_mutex_unlock(&prev_leaf->lock);
+		return ULLONG_MAX;
+	}
+
+	pthread_mutex_lock(&next_leaf->lock);
+	radix_assert((next_leaf->prev == prev_leaf) && (next_leaf->node.offset >= index));
+
+	while (true) {
+		if (cur->node.offset >= end)
+			return cur->node.offset + cur->length;
+		cur = cur->next;
+		pthread_mutex_lock(&cur->lock);
+	}
+}
+
 /* Insert operation entry point. Insert leaf with INDEX to ROOT. Initialize leaf with given INDEX, LENGTH, LOG_ADDR, TX_ID. */
-void radix_tree_insert(radix_tree_root root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id) {
+void radix_tree_insert(struct radix_tree_root *root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id) {
+	radix_tree_do_insert(root, index, length, log_addr, tx_id, true);
+}
+
+static inline void radix_tree_do_insert(struct radix_tree_root *root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id, bool lock_leaf_) {
 	radix_assert((index >> 40) == 0);
-	struct radix_tree_node *node, *child_node, *parent_node;
+	struct radix_tree_node *node, *child_node, *parent_node, *new_node, *new_leaf;
+	struct radix_tree_leaf *prev_leaf, *next_leaf, *new_leaf_;
 	unsigned char parent_key, node_key, level;
 	unsigned long long parent_version, node_version = 0;
-	unsigned long long cur_index;
+	unsigned long long cur_index, lock_end_idx;
+	bool lock_leaf = lock_leaf_, unlock_leaf = false;
+
+	new_leaf_ = (struct radix_tree_leaf *)(new_leaf = alloc_init_leaf(index, length, log_addr, tx_id));
 restart:
 	parent_node = NULL;
 	node = NULL;
-	child_node = *root;
+	child_node = get_root_node(root);
 	cur_index = index;
 	node_key = 0;
 	level = 0;
 
 	if (child_node == NULL) {
-		node = alloc_init_leaf(index, length, log_addr, tx_id);
-		barrier();
-		if (__sync_val_compare_and_swap(root, NULL, node) == NULL)
-			return;
-		else {
-			return_node(node);
-			goto restart;
+		new_leaf_->prev = &root->head;
+		new_leaf_->next = &root->tail;
+		if (lock_leaf) {
+			pthread_mutex_lock(&root->head.lock);
+			if (root->head.next != &root->tail) {
+				pthread_mutex_unlock(&root->head.lock);
+				goto restart;
+			}
+			pthread_mutex_lock(&root->tail.lock);
+			radix_assert(root->tail.prev == &root->head);
+			lock_leaf = false;
+			unlock_leaf = true;
 		}
+		barrier();
+		root->head.next = new_leaf_;
+		root->tail.prev = new_leaf_;
+		if (__sync_val_compare_and_swap(&root->root_node, NULL, new_leaf) == NULL) {
+			if (unlock_leaf) {
+				pthread_mutex_unlock(&root->head.lock);
+				pthread_mutex_unlock(&new_leaf_->lock);
+				pthread_mutex_unlock(&root->tail.lock);
+			}
+			return;
+		}
+		else
+			assert(false);
 	}
 
 	while (true) {
@@ -1000,16 +1161,28 @@ restart:
 		if (level != node->level) {
 			radix_assert(level < node->level);
 			unsigned long long node_prefix = node->offset;
-			switch (check_prefix(cur_index, node_prefix, level, node->level)) {
+			enum check_prefix_result result;
+			switch (result = check_prefix(cur_index, node_prefix, level, node->level)) {
 				case PREFIX_MATCH:
 					level = node->level;
 					cur_index = INDEX_GE(cur_index, 24 + (RADIX_TREE_ENTRY_BIT_SIZE * level));
 					break;
 				default:
-					if (lock_version_or_restart(node, &node_version))
+					if (result == PREFIX_PREV) {
+						prev_leaf = get_right_most_leaf(node);
+						if (prev_leaf == NULL)
+							goto restart;
+						next_leaf = prev_leaf->next;
+					}
+					else {
+						next_leaf = get_left_most_leaf(node);
+						if (next_leaf == NULL)
+							goto restart;
+						prev_leaf = next_leaf->prev;
+					}
+					if (test_leaf_range_or_restart(prev_leaf, next_leaf, index))
 						goto restart;
-					
-					struct radix_tree_node *new_node, *new_leaf;
+
 					unsigned long long cur_prefix = cur_index >> ((RADIX_TREE_HEIGHT + 1 - node->level) * RADIX_TREE_ENTRY_BIT_SIZE);
 					unsigned char match_len, level_diff = node->level - level;
 					node_prefix = INDEX_GE(node_prefix, BITS_PER_INDEX - (level_diff * 8));
@@ -1025,20 +1198,29 @@ restart:
 					new_node->count = 0;
 					new_node->offset = index >> ((RADIX_TREE_HEIGHT + 1 - new_node->level) * RADIX_TREE_ENTRY_BIT_SIZE);
 					new_node->lock_n_obsolete = 0;
-					new_leaf = alloc_init_leaf(index, length, log_addr, tx_id);
 					insert_child_force(new_node, (node_prefix >> ((level_diff - 1 - match_len) * RADIX_TREE_ENTRY_BIT_SIZE)) & RADIX_TREE_MAP_MASK, node);
 					insert_child_force(new_node, (cur_prefix >> ((level_diff - 1 - match_len) * RADIX_TREE_ENTRY_BIT_SIZE)) & RADIX_TREE_MAP_MASK, new_leaf);
+
 					barrier();
 
-					if (parent_node == NULL) {
-						if (__sync_val_compare_and_swap(root, node, new_node) == node) {
-							write_unlock(node);
-							return;
+					if (lock_leaf) {
+						if ((lock_end_idx = lock_leaf_seq_or_restart(prev_leaf, next_leaf, index, length)) == ULLONG_MAX) {
+							return_node(new_node);
+							goto restart;
 						}
-						else {
+						lock_leaf = false;
+						unlock_leaf = true;
+					}
+
+					if (lock_version_or_restart(node, &node_version)) {
+						return_node(new_node);
+						goto restart;
+					}
+
+					if (parent_node == NULL) {
+						if (root_write_lock_or_restart(root, node)) {
 							write_unlock(node);
 							return_node(new_node);
-							return_node(new_leaf);
 							goto restart;
 						}
 					}
@@ -1046,62 +1228,160 @@ restart:
 						if (lock_version_or_restart(parent_node, &parent_version)) {
 							write_unlock(node);
 							return_node(new_node);
-							return_node(new_leaf);
 							goto restart;
 						}
+					}
+
+					new_leaf_->prev = prev_leaf;
+					new_leaf_->next = next_leaf;
+					barrier();
+					prev_leaf->next = new_leaf_;
+					next_leaf->prev = new_leaf_;
+
+					if (parent_node == NULL)
+						root_write_unlock(root, new_node);
+					else {
 						update_child(parent_node, parent_key, new_node);
 						write_unlock(parent_node);
 					}
 					write_unlock(node);
+					link_and_remove_leaf(root, index, length, new_leaf_, prev_leaf, next_leaf);
+					if (unlock_leaf)
+						unlock_leaf_seq(prev_leaf, lock_end_idx);
 					return;
 			}
 		}
 		if (is_leaf(node)) {
-			// Duplicate key.
+			// Overwrite
 			radix_assert(node->offset == index);
+
+			next_leaf = (struct radix_tree_leaf *)node;
+			prev_leaf = next_leaf->prev;
+			if (lock_leaf) {
+				if ((lock_end_idx = lock_leaf_seq_or_restart(prev_leaf, next_leaf, index, length)) == ULLONG_MAX)
+					goto restart;
+				lock_leaf = false;
+				unlock_leaf = true;
+			}
+
+			if (parent_node == NULL) {
+				if (root_write_lock_or_restart(root, node))
+					goto restart;
+			}
+			else {
+				if (lock_version_or_restart(parent_node, &parent_version))
+					goto restart;
+			}
+
+			new_leaf_->prev = prev_leaf;
+			new_leaf_->next = next_leaf;
+			barrier();
+			prev_leaf->next = new_leaf_;
+			next_leaf->prev = new_leaf_;
+			barrier();
+			if (parent_node == NULL)
+				root_write_unlock(root, new_leaf);
+			else {
+				update_child(parent_node, parent_key, new_leaf);
+				write_unlock(parent_node);
+			}
+			barrier();
+			new_leaf_->next = next_leaf->next;
+			next_leaf->next->prev = new_leaf_;
+			barrier();
+			if (unlock_leaf)
+				pthread_mutex_unlock(&next_leaf->lock);
+			return_node_to_gc(node);
+			next_leaf = new_leaf_->next;
+
+			link_and_remove_leaf(root, index, length, new_leaf_, prev_leaf, next_leaf);
+			if (unlock_leaf)
+				unlock_leaf_seq(prev_leaf, lock_end_idx);
 			return;
+
 		}
 
 		node_key = cur_index >> ((RADIX_TREE_HEIGHT - level) * RADIX_TREE_ENTRY_BIT_SIZE);
 		child_node = get_child(node, node_key, level);
 
 		if (child_node == NULL) {
+			switch (get_child_range(node, &child_node, node_key, level)) {
+				case RET_PREV_NODE:
+					prev_leaf = get_right_most_leaf(child_node);
+					if (prev_leaf == NULL)
+						goto restart;
+					next_leaf = prev_leaf->next;
+					break;
+				case RET_NEXT_NODE:
+					next_leaf = get_left_most_leaf(child_node);
+					if (next_leaf == NULL)
+						goto restart;
+					prev_leaf = next_leaf->prev;
+					break;
+				default:
+					goto restart;
+			}
+			if (test_leaf_range_or_restart(prev_leaf, next_leaf, index))
+				goto restart;
+			bool need_expand = radix_node_need_expand(node);
+
+			if (lock_leaf) {
+				if ((lock_end_idx = lock_leaf_seq_or_restart(prev_leaf, next_leaf, index, length)) == ULLONG_MAX)
+					goto restart;
+				lock_leaf = false;
+				unlock_leaf = true;
+			}
+
 			if (lock_version_or_restart(node, &node_version))
 				goto restart;
-			struct radix_tree_node *leaf = alloc_init_leaf(index, length, log_addr, tx_id), *new_node;
-			if (insert_child(node, node_key, leaf)) {
-				write_unlock(node);
-				return;
-			}
-			new_node = radix_node_expand(node);
-			insert_child_force(new_node, node_key, leaf);
-			barrier();
 
-			if (parent_node == NULL) {
-				if (__sync_val_compare_and_swap(root, node, new_node) == node) {
-					write_unlock_obsolete(node);
-					return;
+			if (need_expand) {
+				if (parent_node == NULL) {
+					if (root_write_lock_or_restart(root, node)) {
+						write_unlock(node);
+						goto restart;
+					}
 				}
 				else {
-					write_unlock(node);
-					return_node(new_node);
-					return_node(leaf);
-					goto restart;
+					if (lock_version_or_restart(parent_node, &parent_version)) {
+						write_unlock(node);
+						goto restart;
+					}
 				}
 			}
-			else {
-				if (lock_version_or_restart(parent_node, &parent_version)) {
-					write_unlock(node);
-					return_node(new_node);
-					return_node(leaf);
-					goto restart;
-				}
-				update_child(parent_node, parent_key, new_node);
-				write_unlock(parent_node);
-				write_unlock_obsolete(node);
-				return_node_to_gc(node);
+
+			new_leaf_->prev = prev_leaf;
+			new_leaf_->next = next_leaf;
+			barrier();
+			prev_leaf->next = new_leaf_;
+			next_leaf->prev = new_leaf_;
+
+			if (insert_child(node, node_key, new_leaf)) {
+				radix_assert(!need_expand);
+				write_unlock(node);
+				link_and_remove_leaf(root, index, length, new_leaf_, prev_leaf, next_leaf);
+				if (unlock_leaf)
+					unlock_leaf_seq(prev_leaf, lock_end_idx);
 				return;
 			}
+
+			radix_assert(need_expand);
+			new_node = radix_node_expand(node);
+			insert_child_force(new_node, node_key, new_leaf);
+			barrier();
+
+			if (parent_node == NULL)
+				root_write_unlock(root, new_node);
+			else {
+				update_child(parent_node, parent_key, new_node);
+				write_unlock(parent_node);
+			}
+			write_unlock_obsolete(node);
+			return_node_to_gc(node);
+			link_and_remove_leaf(root, index, length, new_leaf_, prev_leaf, next_leaf);
+			if (unlock_leaf)
+				unlock_leaf_seq(prev_leaf, lock_end_idx);
+			return;
 		}
 
 		level++;
@@ -1110,22 +1390,49 @@ restart:
 }
 
 /* Remove operation entry point. Remove LEAF from ROOT. */
-void radix_tree_remove(radix_tree_root root, struct radix_tree_leaf *leaf) {
+void radix_tree_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf) {
+	radix_tree_do_remove(root, leaf, true);
+}
+
+static inline void radix_tree_do_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf, bool lock_leaf_) {
 	struct radix_tree_node *node, *child_node, *parent_node, *leaf_node = (struct radix_tree_node *)leaf;
+	struct radix_tree_leaf *prev_leaf, *target_leaf, *next_leaf;
 	unsigned long long parent_version, node_version = 0;
 	unsigned char parent_key, node_key, level;
 	unsigned long long cur_index;
+	bool lock_leaf = lock_leaf_, unlock_leaf = false;
 restart:
 	parent_node = NULL;
 	node = NULL;
-	child_node = *root;
+	child_node = get_root_node(root);
 	cur_index = leaf->node.offset;
 	node_key = 0;
 	level = 0;
 
 	radix_assert(child_node != NULL);
 	if (child_node == leaf_node) {
-		if (__sync_val_compare_and_swap(root, leaf_node, NULL) == leaf_node) {
+		if (lock_leaf) {
+			pthread_mutex_lock(&root->head.lock);
+			pthread_mutex_lock(&leaf->lock);
+			pthread_mutex_lock(&root->tail.lock);
+			if ((root->head.next != leaf) || (root->tail.prev != leaf)) {
+				pthread_mutex_unlock(&root->head.lock);
+				pthread_mutex_unlock(&leaf->lock);
+				pthread_mutex_unlock(&root->tail.lock);
+				goto restart;
+			}
+			lock_leaf = false;
+			unlock_leaf = true;
+		}
+		if (__sync_val_compare_and_swap(&root->root_node, leaf_node, NULL) == leaf_node) {
+			root->head.next = &root->tail;
+			root->tail.prev = &root->head;
+			barrier();
+			if (unlock_leaf) {
+				pthread_mutex_unlock(&root->head.lock);
+				pthread_mutex_unlock(&leaf->lock);
+				pthread_mutex_unlock(&root->tail.lock);
+			}
 			return_node_to_gc(leaf_node);
 			return;
 		}
@@ -1133,6 +1440,7 @@ restart:
 			goto restart;
 	}
 	if (is_leaf(child_node))
+		// This point is reachable only when leaf has already been removed.
 		return;
 
 	while (true) {
@@ -1170,42 +1478,72 @@ restart:
 				// This point is reachable only when leaf has already been removed.
 				return;
 			}
+			// TODO: fix locking order to prevent deadlock.
 			if (lock_version_or_restart(node, &node_version))
 				goto restart;
 			radix_assert(node->count != 1);
+
+			target_leaf = (struct radix_tree_leaf *)child_node;
+			prev_leaf = target_leaf->prev;
+			next_leaf = target_leaf->next;
+			if (lock_leaf) {
+				pthread_mutex_lock(&prev_leaf->lock);
+				pthread_mutex_lock(&target_leaf->lock);
+				pthread_mutex_lock(&next_leaf->lock);
+
+				if ((target_leaf->prev != prev_leaf) || (target_leaf->next != next_leaf)) {
+					pthread_mutex_unlock(&prev_leaf->lock);
+					pthread_mutex_unlock(&target_leaf->lock);
+					pthread_mutex_unlock(&next_leaf->lock);
+					write_unlock(node);
+					goto restart;
+				}
+			}
+
 			if (node->count == 2) {
 				struct radix_tree_node *remaining_child = get_child_remain(node, node_key);
 				if (parent_node == NULL) {
-					if (__sync_val_compare_and_swap(root, node, remaining_child) == node) {
-						write_unlock_obsolete(node);
-						return_node_to_gc(node);
-						return_node_to_gc(child_node);
-						return;
-					}
-					else {
+					if (__sync_val_compare_and_swap(&root->root_node, node, remaining_child) != node) {
 						write_unlock(node);
+						if (lock_leaf) {
+							pthread_mutex_unlock(&prev_leaf->lock);
+							pthread_mutex_unlock(&target_leaf->lock);
+							pthread_mutex_unlock(&next_leaf->lock);
+						}
 						goto restart;
 					}
 				}
 				else {
 					if (lock_version_or_restart(parent_node, &parent_version)) {
 						write_unlock(node);
+						if (lock_leaf) {
+							pthread_mutex_unlock(&prev_leaf->lock);
+							pthread_mutex_unlock(&target_leaf->lock);
+							pthread_mutex_unlock(&next_leaf->lock);
+						}
 						goto restart;
 					}
 					update_child(parent_node, parent_key, remaining_child);
 					write_unlock(parent_node);
-					write_unlock_obsolete(node);
-					return_node_to_gc(node);
-					return_node_to_gc(child_node);
-					return;
 				}
+				write_unlock_obsolete(node);
 			}
 			else {
 				delete_child(node, node_key);
 				write_unlock(node);
-				return_node_to_gc(child_node);
-				return;
 			}
+			// Change link between leaves.
+			prev_leaf->next = next_leaf;
+			next_leaf->prev = prev_leaf;
+
+			if (lock_leaf) {
+				pthread_mutex_unlock(&prev_leaf->lock);
+				pthread_mutex_unlock(&target_leaf->lock);
+				pthread_mutex_unlock(&next_leaf->lock);
+			}
+			return_node_to_gc(child_node);
+			return;
 		}
 	}
 }
+

@@ -1,7 +1,7 @@
-CFLAGS = -Wall -march=native -O3
+CFLAGS = -Wall -march=native #-O3
 CFLAGS += -g -DRADIX_DEBUG
 
-all: radix_tree node_allocator test_isolated test_mixed test_remove
+all: radix_tree node_allocator test_isolated test_mixed test_remove test_overlap
 
 radix_tree:
 	gcc -c radix_tree.c $(CFLAGS)
@@ -18,5 +18,8 @@ test_mixed:
 test_remove:
 	gcc test_remove.c radix_tree.o node_allocator.o -o remove -lpthread $(CFLAGS)
 
+test_overlap:
+	gcc test_overlap.c radix_tree.o node_allocator.o -o overlap -lpthread $(CFLAGS)
+
 clean:
-	rm -rf isolated mixed remove radix_tree.o node_allocator.o *.txt
+	rm -rf isolated mixed remove overlap radix_tree.o node_allocator.o *.out

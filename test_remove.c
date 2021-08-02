@@ -9,7 +9,8 @@
 
 #define LEAF_LENGTH 0xFFFFFFFFFFULL //1TB
 
-struct radix_tree_node *root = NULL;
+struct radix_tree_root root;
+
 unsigned long long total_ops, ops_per_thread;
 unsigned long long total_key;
 unsigned long long *key;
@@ -106,6 +107,9 @@ int main(int argv, char *argc[]) {
     unsigned int seed = (unsigned int)time(NULL);
     printf("seed: %u\n", seed);
     srand(seed);
+
+    radix_tree_init();
+    radix_tree_create(&root);
     
     for (i = 0; i < (total_key / 2); i++)
         key[i] = rand_ull();

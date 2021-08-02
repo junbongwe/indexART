@@ -7,11 +7,11 @@
 #include "radix_tree.h"
 
 #define WRITE_THREAD_CNT 16
-#define READ_THREAD_CNT 16
+#define READ_THREAD_CNT 0
 
-#define LEAF_LENGTH 0xFFFFFFFFFFULL //1TB
+#define LEAF_LENGTH 0xFFFFFULL //1TB
 
-struct radix_tree_node *root = NULL;
+struct radix_tree_root root;
 
 volatile bool write_ended = false;
 
@@ -74,6 +74,9 @@ int main(int argc, char *argv[]) {
     unsigned int seed = (unsigned int)time(NULL);
     printf("seed: %u\n", seed);
     srand(seed);
+
+    radix_tree_init();
+    radix_tree_create(&root);
 
     radix_tree_insert(&root, 0xFFFFFFFFFFULL, LEAF_LENGTH, (void *)0xFFFFFFFFFFULL, 0);
 
