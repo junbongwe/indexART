@@ -23,9 +23,9 @@ extern "C"
 #define barrier() asm volatile("": : :"memory")
 
 #define MOVE_BLOCK_SIZE (1UL<<12)
-#define MAX_TRANSACTION 32
+#define MAX_TRANSACTION (1UL<<5) //32
 
-enum lookup_results {
+enum radix_tree_lookup_results {
 	RET_MATCH_NODE, /* Node with requested offset found. */
 	RET_PREV_NODE, /* Node offset is smaller than request but the node contains requested offset*/
 	RET_NEXT_NODE, /* Look up node does not exist, return next. */
@@ -104,7 +104,7 @@ void return_node(struct radix_tree_node *new_node);
 int radix_tree_init();
 void radix_tree_destroy(struct radix_tree_root *root);
 void radix_tree_create(struct radix_tree_root *root);
-enum lookup_results radix_tree_lookup(struct radix_tree_root *root, unsigned long long index, struct radix_tree_leaf **leaf);
+enum radix_tree_lookup_results radix_tree_lookup(struct radix_tree_root *root, unsigned long long index, struct radix_tree_leaf **leaf);
 void radix_tree_insert(struct radix_tree_root *root, unsigned long long index, unsigned long long length, void *log_addr, int tx_id);
 void radix_tree_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf);
 

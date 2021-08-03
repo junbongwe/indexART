@@ -1,6 +1,6 @@
 #!/bin/bash
 
-for i in {1..5000}
+for i in {1..500000}
 do
 	./isolated 1000000 >> isolated.out
 	./mixed 1000000 >> mixed.out

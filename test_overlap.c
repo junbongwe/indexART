@@ -61,6 +61,7 @@ int main(int argc, char *argv[]) {
 
 	unsigned int seed = (unsigned int)time(NULL);
 	printf("seed: %u\n", seed);
+	fflush(stdout);
 	srand(seed);
 
 	radix_tree_init();

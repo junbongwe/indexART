@@ -44,7 +44,7 @@ void *thread_main(void *aux) {
             if (cur_ops == BREAK_OPS)
                 bk_fn();
             leaf = NULL;
-            enum lookup_results r;
+            enum radix_tree_lookup_results r;
             if ((r = radix_tree_lookup(&root, arr[j], &leaf)) != RET_MATCH_NODE) {
                 bk_fn();
                 if (leaf != NULL) {

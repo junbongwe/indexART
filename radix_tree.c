@@ -96,7 +96,7 @@ static inline void radix_tree_do_remove(struct radix_tree_root *root, struct rad
 /* Get child with KEY from PARENT_ node and store child node to NODEP. Parent LEVEL should be given to check child key again.
    If there is child with KEY, return that child. If there is no child with KEY, look for closest previous node and return if
    exist. If there is no previous node, look for closest next node and return. */
-static inline enum lookup_results get_child_range(struct radix_tree_node *parent_, struct radix_tree_node **nodep, unsigned char key, unsigned char level) {
+static inline enum radix_tree_lookup_results get_child_range(struct radix_tree_node *parent_, struct radix_tree_node **nodep, unsigned char key, unsigned char level) {
 	struct radix_tree_node *i_node, *ret_node;
 	unsigned char index_idx, index_pos, bit_idx;
 	unsigned char ret_key, i_key, idx;
@@ -118,10 +118,10 @@ n4_begin:
 				barrier();
 				i_diff = (int)i_key - (int)key;
 				if (i_diff == 0) {
-					if ((ret_node = parent->slots[i]) != NULL) {
-						if (is_fault_node(ret_node, key, level))
+					if ((i_node = parent->slots[i]) != NULL) {
+						if (is_fault_node(i_node, key, level))
 							goto n4_begin;
-						*nodep = ret_node;
+						*nodep = i_node;
 						return RET_MATCH_NODE;
 					}
 				}
@@ -165,10 +165,10 @@ n16_begin:
 				barrier();
 				i_diff = (int)i_key - (int)key;
 				if (i_diff == 0) {
-					if ((ret_node = parent->slots[i]) != NULL) {
-						if (is_fault_node(ret_node, key, level))
+					if ((i_node = parent->slots[i]) != NULL) {
+						if (is_fault_node(i_node, key, level))
 							goto n16_begin;
-						*nodep = ret_node;
+						*nodep = i_node;
 						return RET_MATCH_NODE;
 					}
 				}
@@ -636,8 +636,8 @@ static inline void delete_child(struct radix_tree_node *parent_, unsigned char k
 			last_idx = parent_->count - 1;
 			if (parent->key[last_idx] == key) {
 				parent_->count--;
-				parent->slots[last_idx] = NULL;
 				barrier();
+				parent->slots[last_idx] = NULL;
 				return;
 			}
 			for (idx = 0; idx < last_idx; idx++) {
@@ -663,8 +663,8 @@ static inline void delete_child(struct radix_tree_node *parent_, unsigned char k
 			last_idx = parent_->count - 1;
 			if (parent->key[last_idx] == key) {
 				parent_->count--;
-				parent->slots[last_idx] = NULL;
 				barrier();
+				parent->slots[last_idx] = NULL;
 				return;
 			}
 			short cmp = _mm_cmpeq_epi8_mask(_mm_set1_epi8(key), _mm_loadu_si128((__m128i *)parent->key));
@@ -945,7 +945,7 @@ static inline struct radix_tree_node *radix_tree_do_lookup(struct radix_tree_nod
 }
 
 /* Lookup operation entry point. Find leaf with INDEX from ROOT and store the leaf to LEAF. */
-enum lookup_results radix_tree_lookup(struct radix_tree_root *root, unsigned long long index, struct radix_tree_leaf **leaf) {
+enum radix_tree_lookup_results radix_tree_lookup(struct radix_tree_root *root, unsigned long long index, struct radix_tree_leaf **leaf) {
 	unsigned long long ret_index;
 	struct radix_tree_leaf *ret_leaf;
 
@@ -1389,18 +1389,38 @@ restart:
 	}
 }
 
+static inline void remove_leaf_unlock(struct radix_tree_leaf *leaf, struct radix_tree_leaf *prev, struct radix_tree_leaf *next) {
+	pthread_mutex_unlock(&prev->lock);
+	pthread_mutex_unlock(&leaf->lock);
+	pthread_mutex_unlock(&next->lock);
+}
+
 /* Remove operation entry point. Remove LEAF from ROOT. */
 void radix_tree_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf) {
 	radix_tree_do_remove(root, leaf, true);
 }
 
-static inline void radix_tree_do_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf, bool lock_leaf_) {
+static inline void radix_tree_do_remove(struct radix_tree_root *root, struct radix_tree_leaf *leaf, bool lock_leaf) {
 	struct radix_tree_node *node, *child_node, *parent_node, *leaf_node = (struct radix_tree_node *)leaf;
-	struct radix_tree_leaf *prev_leaf, *target_leaf, *next_leaf;
+	struct radix_tree_leaf *prev_leaf = leaf->prev, *next_leaf = leaf->next;
 	unsigned long long parent_version, node_version = 0;
 	unsigned char parent_key, node_key, level;
 	unsigned long long cur_index;
-	bool lock_leaf = lock_leaf_, unlock_leaf = false;
+	bool unlock_leaf = false;
+
+	if (lock_leaf) {
+lock_restart:
+		pthread_mutex_lock(&prev_leaf->lock);
+		if ((prev_leaf->next != leaf) || (leaf->prev != prev_leaf)) {
+			pthread_mutex_unlock(&prev_leaf->lock);
+			prev_leaf = leaf->prev;
+			goto lock_restart;
+		}
+		pthread_mutex_lock(&leaf->lock);
+		next_leaf = leaf->next;
+		pthread_mutex_lock(&next_leaf->lock);
+		unlock_leaf = true;
+	}
 restart:
 	parent_node = NULL;
 	node = NULL;
@@ -1411,37 +1431,23 @@ restart:
 
 	radix_assert(child_node != NULL);
 	if (child_node == leaf_node) {
-		if (lock_leaf) {
-			pthread_mutex_lock(&root->head.lock);
-			pthread_mutex_lock(&leaf->lock);
-			pthread_mutex_lock(&root->tail.lock);
-			if ((root->head.next != leaf) || (root->tail.prev != leaf)) {
-				pthread_mutex_unlock(&root->head.lock);
-				pthread_mutex_unlock(&leaf->lock);
-				pthread_mutex_unlock(&root->tail.lock);
-				goto restart;
-			}
-			lock_leaf = false;
-			unlock_leaf = true;
-		}
+		root->head.next = &root->tail;
+		root->tail.prev = &root->head;
 		if (__sync_val_compare_and_swap(&root->root_node, leaf_node, NULL) == leaf_node) {
-			root->head.next = &root->tail;
-			root->tail.prev = &root->head;
-			barrier();
-			if (unlock_leaf) {
-				pthread_mutex_unlock(&root->head.lock);
-				pthread_mutex_unlock(&leaf->lock);
-				pthread_mutex_unlock(&root->tail.lock);
-			}
+			if (unlock_leaf)
+				remove_leaf_unlock(prev_leaf, leaf, next_leaf);
 			return_node_to_gc(leaf_node);
 			return;
 		}
 		else
 			goto restart;
 	}
-	if (is_leaf(child_node))
+	if (is_leaf(child_node)) {
 		// This point is reachable only when leaf has already been removed.
+		if (unlock_leaf)
+			remove_leaf_unlock(prev_leaf, leaf, next_leaf);
 		return;
+	}
 
 	while (true) {
 		parent_node = node;
@@ -1460,6 +1466,8 @@ restart:
 					break;
 				default:
 					// This point is reachable only when leaf has already been removed.
+					if (unlock_leaf)
+						remove_leaf_unlock(prev_leaf, leaf, next_leaf);
 					return;
 			}
 		}
@@ -1470,63 +1478,41 @@ restart:
 			if (is_obsolete(node_version) || node_version != get_version(node))
 				goto restart;
 			// This point is reachable only when leaf has already been removed.
+			if (unlock_leaf)
+				remove_leaf_unlock(prev_leaf, leaf, next_leaf);
 			return;
 		}
 
 		if (is_leaf(child_node)) {
 			if (child_node != leaf_node) {
 				// This point is reachable only when leaf has already been removed.
+				radix_assert(child_node->offset == leaf->node.offset);
+				if (unlock_leaf)
+					remove_leaf_unlock(prev_leaf, leaf, next_leaf);
 				return;
 			}
-			// TODO: fix locking order to prevent deadlock.
 			if (lock_version_or_restart(node, &node_version))
 				goto restart;
 			radix_assert(node->count != 1);
-
-			target_leaf = (struct radix_tree_leaf *)child_node;
-			prev_leaf = target_leaf->prev;
-			next_leaf = target_leaf->next;
-			if (lock_leaf) {
-				pthread_mutex_lock(&prev_leaf->lock);
-				pthread_mutex_lock(&target_leaf->lock);
-				pthread_mutex_lock(&next_leaf->lock);
-
-				if ((target_leaf->prev != prev_leaf) || (target_leaf->next != next_leaf)) {
-					pthread_mutex_unlock(&prev_leaf->lock);
-					pthread_mutex_unlock(&target_leaf->lock);
-					pthread_mutex_unlock(&next_leaf->lock);
-					write_unlock(node);
-					goto restart;
-				}
-			}
 
 			if (node->count == 2) {
 				struct radix_tree_node *remaining_child = get_child_remain(node, node_key);
 				if (parent_node == NULL) {
 					if (__sync_val_compare_and_swap(&root->root_node, node, remaining_child) != node) {
 						write_unlock(node);
-						if (lock_leaf) {
-							pthread_mutex_unlock(&prev_leaf->lock);
-							pthread_mutex_unlock(&target_leaf->lock);
-							pthread_mutex_unlock(&next_leaf->lock);
-						}
 						goto restart;
 					}
 				}
 				else {
 					if (lock_version_or_restart(parent_node, &parent_version)) {
 						write_unlock(node);
-						if (lock_leaf) {
-							pthread_mutex_unlock(&prev_leaf->lock);
-							pthread_mutex_unlock(&target_leaf->lock);
-							pthread_mutex_unlock(&next_leaf->lock);
-						}
 						goto restart;
 					}
 					update_child(parent_node, parent_key, remaining_child);
 					write_unlock(parent_node);
 				}
 				write_unlock_obsolete(node);
+				return_node_to_gc(node);
 			}
 			else {
 				delete_child(node, node_key);
@@ -1536,11 +1522,8 @@ restart:
 			prev_leaf->next = next_leaf;
 			next_leaf->prev = prev_leaf;
 
-			if (lock_leaf) {
-				pthread_mutex_unlock(&prev_leaf->lock);
-				pthread_mutex_unlock(&target_leaf->lock);
-				pthread_mutex_unlock(&next_leaf->lock);
-			}
+			if (unlock_leaf)
+				remove_leaf_unlock(prev_leaf, leaf, next_leaf);
 			return_node_to_gc(child_node);
 			return;
 		}

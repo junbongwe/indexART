@@ -1,4 +1,4 @@
-CFLAGS = -Wall -march=native #-O3
+CFLAGS = -Wall -march=native -O3
 CFLAGS += -g -DRADIX_DEBUG
 
 all: radix_tree node_allocator test_isolated test_mixed test_remove test_overlap
